@@ -75,6 +75,18 @@ class EVChargingEnv(ComponentEnv):
         self._df["start_time_min"] = self._round(self._df["start_time_min"])
         self._df["end_time_park_min"] = self._round(self._df["end_time_park_min"])
 
+        # Adjust "start_time_min" to be uniformly distributed in the first 2 hours.
+        self._df["start_time_min"] = np.random.uniform(
+            0, 2 * 60, size=len(self._df)
+        ).astype(int)
+
+        # Adjust "end_time_park_min" to be randomly distributed in the last 2 hours.
+        self._df["end_time_park_min"] = np.random.uniform(
+            (self.max_episode_steps * self.minutes_per_step) - (2 * 60),
+            self.max_episode_steps * self.minutes_per_step,
+            size=len(self._df)
+        ).astype(int)
+
         # Bounds on the observation space variables.
         obs_bounds = OrderedDict({
             "time": (0, self.simulation_times[-1]),
@@ -139,6 +151,7 @@ class EVChargingEnv(ComponentEnv):
             max(0, self.state["real_power_consumed"] - self.peak_threshold)**2
         reward = unserved_reward + peak_reward
         reward /= self.reward_scale
+        # print(f"EV_env Reward: {reward}, Unserved: {unserved_reward}, Peak: {peak_reward}")
         return reward, {"real_power_unserved": unserved_reward, "peak_reward": peak_reward}
 
 

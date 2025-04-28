@@ -85,11 +85,25 @@ class MultiAgentEnv(Env):
         self.action_space = {
             agent.name: agent.action_space for agent in self.agents}
 
+    def close(self):
+        """Clean up resources used by the environment."""
+        # Close the power flow solver if it has a close method
+        if hasattr(self.pf_solver, "close"):
+            self.pf_solver.close()
+
+        # Close all agents if they have a close method
+        for agent in self.agents:
+            if hasattr(agent, "close"):
+                agent.close()
+
+        # Log that the environment has been closed
+        logger.info("MultiAgentEnv has been closed.")
 
     @abstractmethod
     def get_external_obs_vars(
         self, 
-        agent: Union[ComponentEnv, MultiComponentEnv]
+        agent: Union[ComponentEnv, MultiComponentEnv],
+        seed
     ) -> dict:
         """These are external variables to the agents, need to implement how
         they get this data so it can be passed to their reset/step methods
@@ -122,34 +136,37 @@ class MultiAgentEnv(Env):
         return agent_rewards
 
 
-    def reset(self) -> Dict[str, any]:
-
+    def reset(self, seed=None, options=None, **kwargs) -> Tuple[Dict[str, any], dict]:
+        """Reset the environment and return the initial observations for all agents."""
         self.episode_step = 0
         self.time = self.start_time
-        self.history = {"timestamp": [], "voltage": [], "agent_power_p": []}
+        self.history = {"timestamp": [], "voltage": [], "agent_power_p": [], "base_load": [], "losses": []}
+        self.episode_reward = 0
 
         # Run OpenDSS to have voltage info
         self.pf_solver.calculate_power_flow(current_time=self.time)
         self.voltages = self.pf_solver.get_bus_voltages()
+        self.base_load = self.pf_solver._obtain_base_load_info()
+        self.losses = self.pf_solver.get_losses()
 
         # Reset the controllable agents and collect their obs arrays
         for agent in self.agents:
-            kwargs = self.get_external_obs_vars(agent)
+            kwargs = self.get_external_obs_vars(agent, seed=seed)
             _ = agent.reset(**kwargs)
 
-        return self.get_obs()
+        # Return observations and an empty info dictionary
+        return self.get_obs(), {}
 
 
     def get_obs(self) -> Dict[str, any]:
         obs = {}
         for agent in self.agents:
-            kwargs = self.get_external_obs_vars(agent)
+            kwargs = self.get_external_obs_vars(agent, seed=None)
             obs[agent.name], _ = agent.get_obs(**kwargs)
         return obs
 
 
     def step(self, action: Dict[str, any]) -> Tuple[dict, dict, dict, dict]:
-
         self.episode_step += 1
         self.time += self.control_timedelta
         self.obs_dict = {}
@@ -164,9 +181,10 @@ class MultiAgentEnv(Env):
         # agent for use in power flow calculation.
         for agent in self.agents:
             name = agent.name
-            kwargs = self.get_external_obs_vars(agent)
+            kwargs = self.get_external_obs_vars(agent, seed=None)
             obs[name], rew[name], done[name], meta[name] = agent.step(
-                action=action[name], **kwargs)
+                action=action[name], **kwargs
+            )
 
             load_bus = self.agent_name_bus_map[name]
             agent_p_consumed = agent.real_power
@@ -187,11 +205,15 @@ class MultiAgentEnv(Env):
             q_controllable_consumed=load_q
         )
         self.voltages = self.pf_solver.get_bus_voltages()
+        self.base_load = self.pf_solver._obtain_base_load_info()
+        self.losses = self.pf_solver.get_losses()
 
         # Update history dict.
         self.history["timestamp"].append(self.time)
         self.history["voltage"].append(self.voltages.copy())
         self.history["agent_power_p"].append(agent_power_p)
+        self.history["base_load"].append(self.base_load)
+        self.history["losses"].append(self.losses)
 
         # Check for terminal condition.  Currently, we stop the entire simulation
         # if any agent is `done`, although the RLLib API allows agents to finish
@@ -206,15 +228,49 @@ class MultiAgentEnv(Env):
         dones = {a.name: done for a in self.agents}
         dones["__all__"] = done
 
+        # Add final observations for truncated episodes
+        if done or max_steps_reached or time_up:
+            # meta["final_observation"] = obs
+            meta["final_observation"] = obs
+            # Calculate the total episodic reward and length
+            total_reward = sum(rew.values())
+            episode_length = self.episode_step
+
+            # Populate meta["final_info"]
+            meta["final_info"] = {
+                "episode": {
+                    "r": self.episode_reward,  # Total episodic reward
+                    "l": episode_length,  # Episode length
+                }
+            }
+
+        # Transform rewards and meta
         rew = self.reward_transform(rew)
         meta = self.meta_transform(meta)
 
-        return obs, rew, dones, meta
+        truncated = False
+
+        return obs, rew, dones, truncated, meta
 
 
     def reward_transform(self, rew_dict) -> dict:
         """Function to transform the agent rewards based on centralized view.
         Pass-through by default."""
+        
+        power_loss_reward = -self.losses[0]/1e5
+        # logger.info(f"Power loss reward: {power_loss_reward}")
+
+        # Add power_loss_reward to all agent rewards
+        for agent_name in rew_dict:
+            if isinstance(rew_dict[agent_name], (int, float)):
+                rew_dict[agent_name] += power_loss_reward
+
+        # Add up total reward for all agents
+        reward_all_vehicles = sum(value for value in rew_dict.values() if isinstance(value, (int, float)))
+
+        self.episode_reward += reward_all_vehicles
+        # logger.info(f"Episode reward: {self.episode_reward}")
+        # logger.info(f"Agent rewards: {rew_dict}")
         return rew_dict
 
 

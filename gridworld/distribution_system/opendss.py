@@ -133,7 +133,17 @@ class OpenDSSSolver(PowerFlowSolver):
         # 4. Calculate the power flow
         self.dss.run_command('Solve mode=snap')
         self._prepare_bus_voltages()
+        self.losses = self.dss.Circuit.Losses()
 
+    def get_losses(self) -> np.ndarray:
+        """ Get the losses of the system.
+
+        Returns: 
+          losses: Numpy array of (N, 2)
+        """
+        # Note, the losses are already in kW and kvar.
+        losses = np.array(self.losses)
+        return losses
 
     def _set_load(self, current_step_load) -> None:
         """ Set current load to OpenDSS.
