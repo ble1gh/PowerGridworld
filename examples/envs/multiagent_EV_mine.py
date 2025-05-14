@@ -11,7 +11,8 @@ from mpl_toolkits.mplot3d import Axes3D
 import plotting_mine
 
 
-busses = ['671', '634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
+# busses = ['633.1', '634.1', '634.2', '634.3', '645.3', '646.2', '675.2', '675.3', '680.1', '692.2', '611.3', '652.1']
+busses = ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
 
 agents = [
     {
@@ -22,7 +23,7 @@ agents = [
             "num_vehicles": 100,
             "minutes_per_step": 15,
             "max_charge_rate_kw": 7.,
-            "peak_threshold": 100.,
+            "peak_threshold": 700.,
             "vehicle_multiplier": 1.,
             "rescale_spaces": False,
             "reward_scale": 1e5,
@@ -83,6 +84,8 @@ while not done["__all__"]:
     if "final_info" in info:
         print("Final Info: ", info["final_info"])
         # print("info", info)
+        # print(obs)
+        print("final_reward", info["final_info"]["episode"]["r"])
     
     # Plot the rewards for each agent
 plt.figure(figsize=(12, 6))

@@ -9,9 +9,11 @@ from gridworld.agents.vehicles import EVChargingEnv
 from mpl_toolkits.mplot3d import Axes3D
 
 import plotting_mine
+from plotting_mine import plot_2x2_nodal_voltages_and_load_profiles
 
 
-busses = ['671', '634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
+busses = ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
+# busses = ['633.1', '634.1', '634.2', '634.3', '645.3', '646.2', '675.2', '675.3', '680.1', '692.2', '611.3', '652.1']
 
 agents = [
     {
@@ -22,9 +24,10 @@ agents = [
             "num_vehicles": 70,
             "minutes_per_step": 15,
             "max_charge_rate_kw": 7.,
-            "peak_threshold": 100.,
+            "peak_threshold": 700.,
             "vehicle_multiplier": 1.,
-            "rescale_spaces": False
+            "rescale_spaces": False,
+            "unserved_penalty": 0.0,
         }
     } for i in range(len(busses))
 ]
@@ -72,6 +75,7 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.spaces import Box, Dict, flatten_space, flatten
+import wandb
 
 
 @dataclass
@@ -90,7 +94,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
@@ -98,7 +102,7 @@ class Args:
     """the environment id of the task"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    num_envs: int = 1
+    num_envs: int = 4
     """the number of parallel game environments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
@@ -110,15 +114,15 @@ class Args:
     """the batch size of sample from the reply memory"""
     learning_starts: int = 5e3
     """timestep to start learning"""
-    policy_lr: float = 3e-4
+    policy_lr: float = 1e-4
     """the learning rate of the policy network optimizer"""
-    q_lr: float = 1e-3
+    q_lr: float = 5e-4
     """the learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
-    alpha: float = 20
+    alpha: float = 10
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
@@ -142,6 +146,9 @@ class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
             dtype=np.float32,  # Ensure float32 for compatibility
         )
 
+        # print("Observation space:", self.observation_space.shape)
+        # print("Single observation space shape:", self.observation_space.shape)
+
         # Define single_observation_space and single_action_space for vectorized environments
         self.single_observation_space = flatten_space(self.observation_space)
         self.single_observation_space.dtype = np.float32  # Force dtype to float32
@@ -158,7 +165,7 @@ class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
         obs, info = self.multi_agent_env.reset(seed=seed, options=options, **kwargs)
 
         # Flatten the dictionary observation into a single array
-        flattened_obs = np.concatenate([obs[key] for key in sorted(obs.keys())])
+        flattened_obs = np.concatenate([obs[key].astype(np.float32) for key in sorted(obs.keys())])
         return flattened_obs, info
 
     def step(self, action):
@@ -169,16 +176,21 @@ class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
             split_actions[agent] = action[start_idx:start_idx + action_size]
             start_idx += action_size
 
-        obs, rewards, dones, truncated, infos = self.multi_agent_env.step(split_actions)
-        flattened_obs = np.concatenate([obs[key] for key in sorted(obs.keys())])
-        dones["__all__"] = all(dones.values())
+        obs, self.agent_rewards, dones, truncated, infos = self.multi_agent_env.step(split_actions)
 
-        # Ensure "final_info" is always included in infos
-        if "final_info" not in infos:
-            infos["final_info"] = None
+        # Debugging: Print observation shapes
+        # for agent, observation in obs.items():
+        #     print(f"Agent: {agent}, Observation shape: {observation.shape}")
+
+        flattened_obs = np.concatenate([obs[key].astype(np.float32) for key in sorted(obs.keys())])
+        dones = all(dones.values())
+
+        # # Ensure "final_info" is always included in infos
+        # if "final_info" not in infos:
+        #     infos["final_info"] = None
 
         # Aggregate rewards into a single float
-        total_reward = sum(rewards.values())
+        total_reward = sum(self.agent_rewards.values())
 
         # Ensure "final_observation" is included in infos
         if "final_observation" in infos:
@@ -190,25 +202,187 @@ class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
         return flattened_obs, total_reward, dones, truncated, infos
 
     def render(self, mode="human"):
-        return self.multi_agent_env.render(mode)
+        """
+        Renders the environment by plotting:
+        1. Nodal voltages, power losses, and load profiles (2x2 plot).
+        2. Rewards per agent over time.
+        Saves the plots to WandB under the `videos/{run_name}` directory.
+        """
+        if mode != "human":
+            raise NotImplementedError("Only 'human' mode is supported for rendering.")
 
     def close(self):
         return self.multi_agent_env.close()
 
-def make_env(env_id, seed, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = MultiAgentEnv(**env_config)
-            env = MultiAgentEnvWrapper(env)
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = MultiAgentEnv(**env_config)
-            env = MultiAgentEnvWrapper(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.action_space.seed(seed)
-        return env
+def render(rend_env, actor, device, run_name=None):
+    """
+    Renders the environment by plotting:
+    1. Nodal voltages, power losses, and load profiles (2x2 plot).
+    2. Rewards per agent over time.
+    Saves the plots to WandB under the `videos/{run_name}` directory.
+    """
+    import matplotlib.pyplot as plt
+    import os
+    from plotting_mine import plot_2x2_nodal_voltages_and_load_profiles
 
+    if run_name is None:
+        run_name = "default_run"
+
+    # Ensure the videos directory exists
+    video_dir = f"videos/{run_name}"
+    os.makedirs(video_dir, exist_ok=True)
+
+    # Collect data for plotting
+    charging_rates = {agent: [] for agent in rend_env.multi_agent_env.agents}
+    metas = []
+    rewards = []
+    done = False
+
+    # Perform a single deterministic rollout
+    obs = rend_env.reset()
+    while not done:
+        # Use the current policy to generate deterministic actions
+        with torch.no_grad():
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            obs = torch.Tensor(obs).to(device).unsqueeze(0)
+            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+            actions = actions.detach().cpu().numpy()
+            actions = actions.flatten()
+
+        # Step the environment
+        obs, rew, done, truncated, info = rend_env.step(actions)
+        agent_reward_dict = rend_env.agent_rewards  # Access self.agent_rewards within rend_env
+
+
+        if info is None:
+            print("Warning: info is None at this timestep.")
+
+        # Collect rewards and metadata
+        metas.append(info)
+        rewards.append(agent_reward_dict)
+
+        # Collect charging rates for each agent
+        for agent_name, action in zip(rend_env.multi_agent_env.agents, actions):
+            charging_rates[agent_name].append(action)
+
+    # Filter out None values from metas
+    metas = [info for info in metas if info is not None]
+
+    # Prepare data for plotting
+    ev_load_df = plotting_mine.ev_load_to_dataframe(metas, rend_env.multi_agent_env)
+    power_losses_df = power_losses_to_dataframe(rend_env.multi_agent_env)
+
+    # Plot 3D charging rates
+    plot_3d_charging_rates(charging_rates, video_dir)
+    plt.savefig(f"{video_dir}/charging_rates.png")
+    plt.close()
+
+    # Plot 2x2 nodal voltages and load profiles
+    plot_2x2_nodal_voltages_and_load_profiles(rend_env.multi_agent_env, charging_rates, ev_load_df, power_losses_df)
+    plt.savefig(f"{video_dir}/nodal_voltages_and_load_profiles.png")
+    plt.close()
+
+    # Plot rewards per agent over time
+    plt.figure(figsize=(12, 6))
+    # print("Rewards:", rewards)
+    for agent_name in rewards[0].keys():
+        agent_rewards = [reward[agent_name] for reward in rewards]
+        plt.plot(agent_rewards, label=agent_name)
+
+    plt.title("Rewards per Agent Over Time")
+    plt.xlabel("Timestep")
+    plt.ylabel("Reward")
+    plt.grid(True)
+    plt.savefig(f"{video_dir}/rewards_per_agent.png")
+    plt.close()
+
+    # Log the plots to WandB
+    if run_name:
+        wandb.log({
+            "nodal_voltages_and_load_profiles": wandb.Image(f"{video_dir}/nodal_voltages_and_load_profiles.png"),
+            "rewards_per_agent": wandb.Image(f"{video_dir}/rewards_per_agent.png"),
+            "charging_rates": wandb.Image(f"{video_dir}/charging_rates.png"),   
+        })
+        print(f"Plots saved to {video_dir} and logged to WandB.")
+
+def power_losses_to_dataframe(env):
+    """
+    Extracts power losses (real and reactive) from the environment's history and returns them as a DataFrame.
+
+    Args:
+        env: The environment object containing the power flow solver history.
+
+    Returns:
+        pd.DataFrame: A DataFrame with 'time' as the index and columns 'real_power_loss' and 'reactive_power_loss'.
+    """
+    # Extract power losses from env.history["losses"]
+    real_power_losses = [loss[0] for loss in env.history["losses"]]
+    reactive_power_losses = [loss[1] for loss in env.history["losses"]]
+
+    # Convert to kW
+    real_power_losses = np.array(real_power_losses) / 1000.0
+    reactive_power_losses = np.array(reactive_power_losses) / 1000.0
+
+    # Generate a 'time' column assuming timesteps are evenly spaced
+    start_time = pd.to_datetime(common_config["start_time"])
+    timestep_delta = common_config["control_timedelta"]
+    time = [start_time + i * timestep_delta for i in range(len(real_power_losses))]
+
+    # Create the DataFrame
+    power_losses_df = pd.DataFrame({
+        "time": time,
+        "real_power_loss": real_power_losses,
+        "reactive_power_loss": reactive_power_losses
+    }).set_index("time")
+
+    return power_losses_df
+
+def make_env():
+    def thunk():
+        env = MultiAgentEnv(**env_config)
+        env = MultiAgentEnvWrapper(env)
+        # if capture_video and idx == 0:
+        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        # env.action_space.seed(seed)
+        return env
     return thunk
+
+def plot_3d_charging_rates(charging_rates, video_dir):
+    """
+    Creates a 3D plot of EV charging rates over time for each agent.
+
+    Args:
+        charging_rates (dict): A dictionary where keys are agent names and values are lists of actions (charging rates) over timesteps.
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import numpy as np
+
+    # Create a 3D plot
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Create a 2D plot for EV charging rates over time
+    plt.figure(figsize=(12, 8))
+
+    # Iterate over agents and their charging rates
+    for agent_name, rates in charging_rates.items():
+        # Ensure rates are a 1D array
+        rates = np.array(rates).flatten()
+
+        # Plot the charging rates over time for the agent
+        plt.plot(range(len(rates)), rates, label=agent_name)
+
+    # Add labels, legend, and title
+    plt.xlabel("Timestep")
+    plt.ylabel("Charging Rate (percentage)")
+    plt.title("EV Charging Rates Over Time")
+    plt.legend()
+    plt.grid(True)
+
+    return fig
 
 # # Create the multi-agent environment
 # multi_agent_env = MultiAgentEnv(**env_config)
@@ -341,9 +515,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env() for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+
+    rend_env = MultiAgentEnv(**env_config)
+    rend_env = MultiAgentEnvWrapper(rend_env)
 
     # print("Observation space:", envs.single_observation_space)
     # print("Action space:", envs.single_action_space)
@@ -395,13 +572,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if terminations.all() or truncations.all():  # Check if the episode is done
             # Debugging: Print the infos dictionary
-            #print(f"Infos at global_step={global_step}: {infos}")
+            # print(f"Infos at global_step={global_step}: {infos}")
             if "_final_info" in infos:
                 # print(f"Structure of final_info at global_step={global_step}: {infos['episode']['r']}")
                 if infos is not None:
                     # print(f"global_step={global_step}, episodic_return={infos['episode']['r']}, episodic_length={infos['episode']['l']}")
                     writer.add_scalar("charts/episodic_return", np.mean(infos["episode"]["r"]), global_step)
                     writer.add_scalar("charts/episodic_length", np.mean(infos["episode"]["l"]), global_step)
+                    print(f"global_step={global_step}, episodic_return={infos['episode']['r']}, episodic_length={infos['episode']['l']}")
+                    # print("Final Info:", infos["final_info"])
                 else:
                     print(f"Warning: 'final_info' is None at global_step={global_step}.")
             else:
@@ -485,26 +664,28 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
-                
+                render(rend_env, actor=actor, device=device, run_name=run_name)
+
                 # deterministic rollout
                 with torch.no_grad():
                     deterministic_actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+                
 
-            if global_step % 1000 == 0:
-                # Ensure the 'models/' directory exists
-                os.makedirs("models", exist_ok=True)
-                # Save model parameters
-                torch.save({
-                    'actor_state_dict': actor.state_dict(),
-                    'qf1_state_dict': qf1.state_dict(),
-                    'qf2_state_dict': qf2.state_dict(),
-                    'qf1_target_state_dict': qf1_target.state_dict(),
-                    'qf2_target_state_dict': qf2_target.state_dict(),
-                    'actor_optimizer_state_dict': actor_optimizer.state_dict(),
-                    'q_optimizer_state_dict': q_optimizer.state_dict(),
-                    'log_alpha': log_alpha if args.autotune else None,
-                    'a_optimizer_state_dict': a_optimizer.state_dict() if args.autotune else None,
-                }, f"models/{run_name}.pth")
+            #if global_step % 1000 == 0:
+                # # Ensure the 'models/' directory exists
+                # os.makedirs("models", exist_ok=True)
+                # # Save model parameters
+                # torch.save({'actor_state_dict': actor.state_dict(),
+                #     'qf1_state_dict': qf1.state_dict(),
+                #     'qf2_state_dict': qf2.state_dict(),
+                #     'qf1_target_state_dict': qf1_target.state_dict(),
+                #     'qf2_target_state_dict': qf2_target.state_dict(),
+                #     'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+                #     'q_optimizer_state_dict': q_optimizer.state_dict(),
+                #     'log_alpha': log_alpha if args.autotune else None,
+                #     'a_optimizer_state_dict': a_optimizer.state_dict() if args.autotune else None,
+                # }, f"models/{run_name}.pth")
+                
 
 
     envs.close()

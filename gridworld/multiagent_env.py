@@ -16,6 +16,25 @@ except ImportError:
     Env = object
     logger.warning("rllib MultiAgentEnv not found, using generic object class")
 
+from gymnasium.spaces import Box
+
+bus_name_mapping = {
+    "634a": "634.1",
+    "634b": "634.2",
+    "634c": "634.3",
+    "645": "645.2",
+    "675a": "675.1",
+    "675b": "675.2",
+    "675c": "675.3",
+    "670a": "670.1",
+    "670b": "670.2",
+    "670c": "670.3",
+    "684c": "684.3",
+    "611": "611.3",
+    "652": "652.1",
+    "671": "671.1.2.3",  # Example for a 3-phase bus
+}
+
 
 class MultiAgentEnv(Env):
     """This class implements the multi-agent environment created from a list
@@ -81,7 +100,13 @@ class MultiAgentEnv(Env):
 
         # Create the gym observation and action spaces.
         self.observation_space = {
-            agent.name: agent.observation_space for agent in self.agents}
+            agent.name: Box(
+                low=np.concatenate([agent.observation_space.low, [0]]),
+                high=np.concatenate([agent.observation_space.high, [np.inf]]),
+                dtype=np.float32
+            )
+            for agent in self.agents
+        }
         self.action_space = {
             agent.name: agent.action_space for agent in self.agents}
 
@@ -155,7 +180,9 @@ class MultiAgentEnv(Env):
             _ = agent.reset(**kwargs)
 
         # Return observations and an empty info dictionary
-        return self.get_obs(), {}
+        obs = self.get_obs()
+        obs = self.obs_transform(obs)
+        return obs, {}
 
 
     def get_obs(self) -> Dict[str, any]:
@@ -222,11 +249,23 @@ class MultiAgentEnv(Env):
         max_steps_reached = (self.episode_step == self.max_episode_steps - 1)
         time_up = self.time >= self.end_time
         done = any_done or max_steps_reached or time_up
+        # print(f"Episode step: {self.episode_step}, Done: {done}, Time up: {time_up}, Max steps reached: {max_steps_reached}")
 
         # Create the dones dict that will be returned.  We assume all are done
         # or not simulataneously.
         dones = {a.name: done for a in self.agents}
         dones["__all__"] = done
+
+        # Transform rewards and meta
+        rew = self.reward_transform(rew)
+        meta = self.meta_transform(meta)
+        obs = self.obs_transform(obs)
+
+        for agent_name in rew:
+            if "episode" not in meta[agent_name]:
+                meta[agent_name]["episode"] = {"r": 0, "l": 0}
+            meta[agent_name]["episode"]["r"] += rew[agent_name]
+            meta[agent_name]["episode"]["l"] = self.episode_step
 
         # Add final observations for truncated episodes
         if done or max_steps_reached or time_up:
@@ -243,27 +282,71 @@ class MultiAgentEnv(Env):
                     "l": episode_length,  # Episode length
                 }
             }
-
-        # Transform rewards and meta
-        rew = self.reward_transform(rew)
-        meta = self.meta_transform(meta)
+            #print(f"Episode finished. Total reward: {self.episode_reward}, Length: {episode_length}")
 
         truncated = False
 
         return obs, rew, dones, truncated, meta
 
+    def obs_transform(self, obs_dict) -> dict:
+        """Function to transform the agent observations based on centralized view."""
+        for agent_name in obs_dict:
+            # Ensure the observation array is of type float32
+            obs_dict[agent_name] = obs_dict[agent_name].astype(np.float32)
+
+            # Get the bus name in numeric form
+            bus_name = self.agent_name_bus_map[agent_name]
+            numeric_bus_name = bus_name_mapping.get(bus_name, bus_name)  # Default to original if not found
+
+            # Get the voltage for the agent's bus and ensure it is a float32
+            voltage = float(self.voltages[numeric_bus_name])
+
+            # Append the voltage to the observation
+            obs_dict[agent_name] = np.append(obs_dict[agent_name], voltage).astype(np.float32)
+
+        return obs_dict
 
     def reward_transform(self, rew_dict) -> dict:
         """Function to transform the agent rewards based on centralized view.
         Pass-through by default."""
         
+        # Calculate the power loss reward
         power_loss_reward = -self.losses[0]/1e5
         # logger.info(f"Power loss reward: {power_loss_reward}")
+
+        # Calculate voltage violation reward
+        voltage_reward = 0
+        # Check if any voltage is below 0.95 p.u.
+        # If so, calculate the total voltage difference from 0.95 p.u.
+        if np.any(np.array(list(self.voltages.values())) < 0.95):
+            voltage_differences = [0.95 - v for v in self.voltages.values() if v < 0.95]
+            total_voltage_difference = sum(voltage_differences)
+            voltage_reward = -total_voltage_difference*1e3
+        
+        # Assuming `output` is the variable containing the data
+        total_load = []
+        for item in self.history['base_load'][:]:
+            bus_names, data_array = item  # Unpack the tuple
+            load = data_array[:, 0].sum()  # Extract the first column
+            total_load.append(load)
+
+        # Convert the list of arrays to a 2D numpy array
+        total_load_array = np.array(total_load)
+        
+        # Load stability reward
+        # print(f"base_load: {self.history['base_load'][:]}")
+        load_penalty = -np.linalg.norm(total_load_array)/1e5
+        # print(f"Load penalty: {load_penalty}")
+        
+        # print(f"Voltage reward: {voltage_reward}")
 
         # Add power_loss_reward to all agent rewards
         for agent_name in rew_dict:
             if isinstance(rew_dict[agent_name], (int, float)):
-                rew_dict[agent_name] += power_loss_reward
+                rew_dict[agent_name] += power_loss_reward + voltage_reward + load_penalty
+            else:
+                # Alert if the reward is not a number
+                logger.warning(f"Reward for agent {agent_name} is not a number: {rew_dict[agent_name]}")
 
         # Add up total reward for all agents
         reward_all_vehicles = sum(value for value in rew_dict.values() if isinstance(value, (int, float)))

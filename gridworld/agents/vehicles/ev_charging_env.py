@@ -99,7 +99,7 @@ class EVChargingEnv(ComponentEnv):
             "mean_charge_rate_deficit": (
                 0, self._df["energy_required_kwh"].max() / (self.minutes_per_step / 60.)),
             "real_power_unserved": (
-                0, self._df["energy_required_kwh"].max())
+                0, self._df["energy_required_kwh"].max()),
         })
 
         # Construct the gym spaces.

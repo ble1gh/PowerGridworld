@@ -214,3 +214,72 @@ def plot_2x2_nodal_voltages_and_load_profiles(env, charging_rates, load_profile_
 
     # Show the combined figure
     plt.show()
+
+def ev_load_to_dataframe(metas, env):    
+    """
+    Converts the 'real_power_consumed' from metas and 'base_load' from env.history into a DataFrame of total EV load,
+    total base load, and timesteps.
+
+    Args:
+        metas (list): A list of metadata dictionaries containing 'real_power_consumed' for each timestep.
+        env: The environment object containing the 'base_load' history.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing 'time', 'total_ev_load', and 'total_base_load' columns.
+    """
+    # Extract real power consumed and calculate total EV load for each timestep
+    total_ev_load = [
+        sum(agent_data.get("real_power_consumed", 0) for agent_data in info.values())
+        for info in metas
+    ]
+
+    # Extract base load from env.history["base_load"] and calculate total base load for each timestep
+    total_base_load = [
+        np.sum(base_load[1][:, 0]) for base_load in env.history["base_load"]
+    ]
+
+    # Generate a 'time' column assuming timesteps are evenly spaced
+    start_time = pd.to_datetime(common_config["start_time"])
+    timestep_delta = common_config["control_timedelta"]
+    time = [start_time + i * timestep_delta for i in range(len(total_ev_load))]
+
+    # Create the DataFrame
+    ev_load_df = pd.DataFrame({
+        "time": time,
+        "total_ev_load": total_ev_load,
+        "total_load": total_base_load
+    })
+
+    return ev_load_df
+
+def power_losses_to_dataframe(env):
+    """
+    Extracts power losses (real and reactive) from the environment's history and returns them as a DataFrame.
+
+    Args:
+        env: The environment object containing the power flow solver history.
+
+    Returns:
+        pd.DataFrame: A DataFrame with 'time' as the index and columns 'real_power_loss' and 'reactive_power_loss'.
+    """
+    # Extract power losses from env.history["losses"]
+    real_power_losses = [loss[0] for loss in env.history["losses"]]
+    reactive_power_losses = [loss[1] for loss in env.history["losses"]]
+
+    # Convert to kW
+    real_power_losses = np.array(real_power_losses) / 1000.0
+    reactive_power_losses = np.array(reactive_power_losses) / 1000.0
+
+    # Generate a 'time' column assuming timesteps are evenly spaced
+    start_time = pd.to_datetime(common_config["start_time"])
+    timestep_delta = common_config["control_timedelta"]
+    time = [start_time + i * timestep_delta for i in range(len(real_power_losses))]
+
+    # Create the DataFrame
+    power_losses_df = pd.DataFrame({
+        "time": time,
+        "real_power_loss": real_power_losses,
+        "reactive_power_loss": reactive_power_losses
+    }).set_index("time")
+
+    return power_losses_df
